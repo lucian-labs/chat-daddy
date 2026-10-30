@@ -17,7 +17,7 @@ Minimal, keyboard-driven chat transcript viewer for AI coding assistants. Pixel-
 - **10 built-in themes** — Tokyo Night, Nord, Dracula, Catppuccin, Gruvbox, and more. Press `T` to cycle live
 - **Custom themes** — drop JSON files in `~/.chat-daddy/themes/` to add your own
 - **Keyboard-driven** — search, star, rename, navigate between chats without touching the mouse
-- **LAN peer sync** — instances on different machines discover each other via UDP broadcast, show remote chats inline with names
+- **LAN peer sync** — machines that share a join code see each other's chats inline; traffic is encrypted, off until a code is set
 - **Splash screen** — pulsing icon while loading, no blank window on startup
 - **Window memory** — remembers position and size across sessions
 
@@ -95,6 +95,8 @@ Press `?` in-app for the full hotkey overlay.
 | /         | Search                  |
 | N         | Rename chat             |
 | T         | Cycle theme             |
+| J         | Join code               |
+| Shift+J   | New join code           |
 | ?         | Help overlay            |
 | Escape    | Quit                    |
 
@@ -152,7 +154,13 @@ See the full color key list in [config defaults](src/main.rs).
 
 ## LAN Peer Sync
 
-Instances on the same network automatically discover each other via UDP broadcast on port 21847. Remote chats appear inline in your list with the peer's hostname, including their chat names.
+Off by default. Machines that share a join code find each other on the LAN and show each other's chats inline.
+
+1. On one machine, press `Shift+J` — a new code (`XXXX-XXXX-XXXX-XXXX`) is made and copied.
+2. On each other machine, press `J`, type or `Ctrl+V` the code, `Enter`.
+3. `J` then `Enter` on an empty code turns sync off. `Shift+J` again rotates the code (everyone re-joins).
+
+The code is stored as `"join_code"` in `~/.chat-daddy/config.json`. Discovery beacons (UDP 21847) and chat transfers (TCP, random port) are sealed with ChaCha20-Poly1305 under a key derived from the code; machines without it can't see, list, or read anything. Treat the code like a password.
 
 **Firewall:** On Windows, you may need to allow chat-daddy through the firewall:
 
@@ -164,7 +172,7 @@ netsh advfirewall firewall add rule name="chat-daddy TCP" dir=in action=allow pr
 
 On macOS, click "Allow" when prompted for incoming connections on first launch.
 
-Press `?` to see your hostname, listening port, and connected peers.
+Press `?` to see your join code and connected peers.
 
 ## LLM Auto-Naming
 

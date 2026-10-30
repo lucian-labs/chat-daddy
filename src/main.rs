@@ -4,6 +4,7 @@
 #![windows_subsystem = "windows"]
 
 mod font;
+mod join;
 
 use arboard::Clipboard;
 use chrono::{Local, TimeZone};
@@ -14,9 +15,10 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader, Write as IoWrite};
+use std::io::{BufRead, BufReader};
 use std::net::{TcpListener, TcpStream, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
@@ -411,6 +413,7 @@ struct AppConfig {
     font_weight: u16,   // 300 = light, 400 = regular, 500 = medium
     theme: Theme,
     llm_endpoint: String, // local LLM for auto-naming, e.g. "http://localhost:1235"
+    join_code: Option<String>, // LAN sync group; None = sync off
 }
 
 fn parse_sources(val: &Value) -> Vec<SourceConfig> {
@@ -492,6 +495,10 @@ fn load_config() -> AppConfig {
                 .and_then(|e| e.as_str())
                 .unwrap_or("http://localhost:1235")
                 .to_string();
+            let join_code = val
+                .get("join_code")
+                .and_then(|c| c.as_str())
+                .and_then(join::normalize);
 
             if !sources.is_empty() {
                 return AppConfig {
@@ -500,6 +507,7 @@ fn load_config() -> AppConfig {
                     font_weight,
                     theme,
                     llm_endpoint,
+                    join_code,
                 };
             }
         }
@@ -513,6 +521,7 @@ fn load_config() -> AppConfig {
         font_weight: 300,
         theme: Theme::default(),
         llm_endpoint: "http://localhost:1235".into(),
+        join_code: None,
     };
     save_config(&cfg);
     cfg
@@ -599,6 +608,7 @@ fn save_config(cfg: &AppConfig) {
         "font": cfg.font,
         "font_weight": cfg.font_weight,
         "llm_endpoint": cfg.llm_endpoint,
+        "join_code": cfg.join_code,
         "colors": theme_to_json(&cfg.theme),
         "sources": sources_to_json(&cfg.sources),
     });
@@ -787,6 +797,7 @@ fn llm_is_healthy(endpoint: &str) -> bool {
 struct RemoteOrigin {
     hostname: String,
     tcp_addr: SocketAddr,
+    key: join::GroupKey,
 }
 
 #[derive(Clone)]
@@ -806,6 +817,10 @@ struct TranscriptEntry {
 // --- LAN peer sync ---
 
 const LAN_PORT: u16 = 21847;
+const MAX_PEER_CONNS: usize = 16;
+
+/// Current group key; None means sync is off.
+type SharedKey = Arc<Mutex<Option<join::GroupKey>>>;
 
 struct PeerInfo {
     hostname: String,
@@ -2039,6 +2054,7 @@ fn rebuild_view(
 }
 
 // --- LAN peer sync functions ---
+// Silent until a join code is set; see join.rs for the wire format.
 
 fn get_hostname() -> String {
     env::var("COMPUTERNAME")
@@ -2055,28 +2071,72 @@ fn get_hostname() -> String {
         .unwrap_or_else(|_| "unknown".into())
 }
 
-fn start_tcp_server(listener: TcpListener, sources: Vec<SourceConfig>) {
+fn current_key(key: &SharedKey) -> Option<join::GroupKey> {
+    key.lock().ok().and_then(|k| k.clone())
+}
+
+/// Bind and spawn the sync threads. Returns the TCP port, or 0 if binding failed.
+fn start_sync(
+    sources: Vec<SourceConfig>,
+    key: SharedKey,
+    peer_state: Arc<Mutex<PeerState>>,
+    hostname: String,
+) -> u16 {
+    let Ok(listener) = TcpListener::bind("0.0.0.0:0") else { return 0 };
+    let Ok(port) = listener.local_addr().map(|a| a.port()) else { return 0 };
+    let instance = join::instance_id();
+    start_tcp_server(listener, sources, Arc::clone(&key));
+    start_beacon_sender(hostname, port, instance.clone(), Arc::clone(&key));
+    start_beacon_listener(peer_state, instance, key);
+    port
+}
+
+/// Set or clear the join code, drop peers from the old group, persist.
+fn apply_join_code(
+    code: Option<String>,
+    cfg: &mut AppConfig,
+    key: &SharedKey,
+    peer_state: &Arc<Mutex<PeerState>>,
+) {
+    if let Ok(mut k) = key.lock() {
+        *k = code.as_deref().and_then(join::GroupKey::from_code);
+    }
+    if let Ok(mut ps) = peer_state.lock() {
+        ps.peers.clear();
+        ps.remote_entries.clear();
+        ps.dirty = true;
+    }
+    cfg.join_code = code;
+    save_config(cfg);
+}
+
+fn start_tcp_server(listener: TcpListener, sources: Vec<SourceConfig>, key: SharedKey) {
+    let active = Arc::new(AtomicUsize::new(0));
     thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
+            let Some(k) = current_key(&key) else { continue };
+            if active.load(Ordering::SeqCst) >= MAX_PEER_CONNS {
+                continue;
+            }
+            active.fetch_add(1, Ordering::SeqCst);
             let srcs = sources.clone();
+            let active = Arc::clone(&active);
             thread::spawn(move || {
-                handle_tcp_client(stream, &srcs);
+                handle_tcp_client(stream, &srcs, &k);
+                active.fetch_sub(1, Ordering::SeqCst);
             });
         }
     });
 }
 
-fn handle_tcp_client(stream: TcpStream, sources: &[SourceConfig]) {
+fn handle_tcp_client(stream: TcpStream, sources: &[SourceConfig], key: &join::GroupKey) {
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
-    let Ok(write_stream) = stream.try_clone() else { return };
-    let mut writer = write_stream;
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    if reader.read_line(&mut line).is_err() {
-        return;
-    }
-    let line = line.trim().to_string();
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(10)));
+    let Some(mut ch) = join::Channel::accept(stream, key) else { return };
+    let Some(req) = ch.recv(join::MAX_REQUEST) else { return };
+    let req = String::from_utf8_lossy(&req);
+    let line = req.trim();
     if line == "LIST" {
         let transcripts = get_all_transcripts(sources);
         let chats = load_chats();
@@ -2096,8 +2156,7 @@ fn handle_tcp_client(stream: TcpStream, sources: &[SourceConfig]) {
             obj
         }).collect();
         let json = serde_json::to_string(&arr).unwrap_or_else(|_| "[]".into());
-        let _ = writer.write_all(json.as_bytes());
-        let _ = writer.write_all(b"\n");
+        let _ = ch.send(json.as_bytes());
     } else if let Some(uuid) = line.strip_prefix("GET ") {
         let uuid = uuid.trim();
         // find the transcript by uuid
@@ -2112,10 +2171,9 @@ fn handle_tcp_client(stream: TcpStream, sources: &[SourceConfig]) {
                 })
             }).collect();
             let json = serde_json::to_string(&arr).unwrap_or_else(|_| "[]".into());
-            let _ = writer.write_all(json.as_bytes());
-            let _ = writer.write_all(b"\n");
+            let _ = ch.send(json.as_bytes());
         } else {
-            let _ = writer.write_all(b"[]\n");
+            let _ = ch.send(b"[]");
         }
     }
 }
@@ -2142,32 +2200,32 @@ fn get_broadcast_addrs() -> Vec<SocketAddr> {
     addrs
 }
 
-fn start_beacon_sender(hostname: String, tcp_port: u16) {
+fn start_beacon_sender(hostname: String, tcp_port: u16, instance: String, key: SharedKey) {
     thread::spawn(move || {
         let Ok(sock) = UdpSocket::bind("0.0.0.0:0") else { return };
         let _ = sock.set_broadcast(true);
-        let beacon = format!(
-            "{{\"h\":\"{}\",\"p\":{},\"v\":\"0.1.0\"}}\n",
-            hostname, tcp_port
-        );
+        let beacon = serde_json::json!({ "h": hostname, "p": tcp_port, "i": instance }).to_string();
         loop {
-            let dests = get_broadcast_addrs();
-            for dest in &dests {
-                let _ = sock.send_to(beacon.as_bytes(), dest);
+            if let Some(k) = current_key(&key) {
+                let pkt = k.seal_beacon(beacon.as_bytes());
+                for dest in &get_broadcast_addrs() {
+                    let _ = sock.send_to(&pkt, dest);
+                }
             }
             thread::sleep(std::time::Duration::from_secs(3));
         }
     });
 }
 
-fn refresh_remote_entries(peer_state: &Arc<Mutex<PeerState>>) {
+fn refresh_remote_entries(peer_state: &Arc<Mutex<PeerState>>, key: &SharedKey) {
+    let Some(k) = current_key(key) else { return };
     let addrs: Vec<(SocketAddr, String)> = {
         let Ok(ps) = peer_state.lock() else { return };
         ps.peers.iter().map(|(addr, info)| (*addr, info.hostname.clone())).collect()
     };
     let mut all_remote = Vec::new();
     for (addr, hostname) in &addrs {
-        let entries = fetch_peer_list(*addr, hostname);
+        let entries = fetch_peer_list(*addr, hostname, &k);
         all_remote.extend(entries);
     }
     if let Ok(mut ps) = peer_state.lock() {
@@ -2176,7 +2234,7 @@ fn refresh_remote_entries(peer_state: &Arc<Mutex<PeerState>>) {
     }
 }
 
-fn start_beacon_listener(peer_state: Arc<Mutex<PeerState>>, my_hostname: String) {
+fn start_beacon_listener(peer_state: Arc<Mutex<PeerState>>, instance: String, key: SharedKey) {
     thread::spawn(move || {
         let Ok(sock) = UdpSocket::bind(format!("0.0.0.0:{}", LAN_PORT)) else {
             eprintln!("[chat-daddy] failed to bind UDP port {}", LAN_PORT);
@@ -2188,12 +2246,13 @@ fn start_beacon_listener(peer_state: Arc<Mutex<PeerState>>, my_hostname: String)
         loop {
             match sock.recv_from(&mut buf) {
                 Ok((n, src_addr)) => {
-                    let msg = String::from_utf8_lossy(&buf[..n]).to_string();
-                    let msg = msg.trim();
-                    let Ok(val) = serde_json::from_str::<Value>(msg) else { continue };
+                    // only beacons sealed with our code get through
+                    let Some(k) = current_key(&key) else { continue };
+                    let Some(plain) = k.open_beacon(&buf[..n]) else { continue };
+                    let Ok(val) = serde_json::from_slice::<Value>(&plain) else { continue };
                     let Some(h) = val.get("h").and_then(|v| v.as_str()) else { continue };
                     let Some(p) = val.get("p").and_then(|v| v.as_u64()) else { continue };
-                    if h == my_hostname {
+                    if val.get("i").and_then(|v| v.as_str()) == Some(instance.as_str()) {
                         continue; // skip self
                     }
                     let tcp_port = p as u16;
@@ -2212,7 +2271,7 @@ fn start_beacon_listener(peer_state: Arc<Mutex<PeerState>>, my_hostname: String)
                     }
                     // immediate fetch on new peer, periodic refresh otherwise
                     if is_new || last_refresh.elapsed().as_secs() >= 5 {
-                        refresh_remote_entries(&peer_state);
+                        refresh_remote_entries(&peer_state, &key);
                         last_refresh = Instant::now();
                     }
                 }
@@ -2225,27 +2284,26 @@ fn start_beacon_listener(peer_state: Arc<Mutex<PeerState>>, my_hostname: String)
             }
             // always refresh periodically regardless of beacon activity
             if last_refresh.elapsed().as_secs() >= 5 {
-                refresh_remote_entries(&peer_state);
+                refresh_remote_entries(&peer_state, &key);
                 last_refresh = Instant::now();
             }
         }
     });
 }
 
-fn fetch_peer_list(addr: SocketAddr, hostname: &str) -> Vec<TranscriptEntry> {
-    let Ok(stream) = TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2)) else {
-        return vec![];
-    };
+/// One sealed request/response round trip with a peer.
+fn peer_request(addr: SocketAddr, key: &join::GroupKey, req: &str) -> Option<Vec<Value>> {
+    let stream = TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2)).ok()?;
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
-    let mut writer = match stream.try_clone() { Ok(w) => w, Err(_) => return vec![] };
-    if writer.write_all(b"LIST\n").is_err() {
-        return vec![];
-    }
-    let mut reader = BufReader::new(stream);
-    let mut response = String::new();
-    let _ = reader.read_line(&mut response);
-    let response = response.trim();
-    let Ok(arr) = serde_json::from_str::<Vec<Value>>(response) else {
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
+    let mut ch = join::Channel::connect(stream, key)?;
+    ch.send(req.as_bytes())?;
+    let resp = ch.recv(join::MAX_RESPONSE)?;
+    serde_json::from_slice(&resp).ok()
+}
+
+fn fetch_peer_list(addr: SocketAddr, hostname: &str, key: &join::GroupKey) -> Vec<TranscriptEntry> {
+    let Some(arr) = peer_request(addr, key, "LIST") else {
         return vec![];
     };
     arr.iter().filter_map(|v| {
@@ -2268,27 +2326,15 @@ fn fetch_peer_list(addr: SocketAddr, hostname: &str) -> Vec<TranscriptEntry> {
             remote: Some(RemoteOrigin {
                 hostname: hostname.to_string(),
                 tcp_addr: addr,
+                key: key.clone(),
             }),
             remote_name,
         })
     }).collect()
 }
 
-fn fetch_remote_messages(addr: SocketAddr, uuid: &str) -> Vec<MessageLine> {
-    let Ok(stream) = TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2)) else {
-        return vec![];
-    };
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
-    let mut writer = match stream.try_clone() { Ok(w) => w, Err(_) => return vec![] };
-    let cmd = format!("GET {}\n", uuid);
-    if writer.write_all(cmd.as_bytes()).is_err() {
-        return vec![];
-    }
-    let mut reader = BufReader::new(stream);
-    let mut response = String::new();
-    let _ = reader.read_line(&mut response);
-    let response = response.trim();
-    let Ok(arr) = serde_json::from_str::<Vec<Value>>(response) else {
+fn fetch_remote_messages(origin: &RemoteOrigin, uuid: &str) -> Vec<MessageLine> {
+    let Some(arr) = peer_request(origin.tcp_addr, &origin.key, &format!("GET {}", uuid)) else {
         return vec![];
     };
     arr.iter().filter_map(|v| {
@@ -2442,25 +2488,25 @@ fn main() {
     let mut quit_requested = false;
     let mut available_themes = load_available_themes();
     let mut theme_selected: usize = 0;
-    let mut theme_flash: Option<Instant> = None;
+    let mut flash: Option<(Instant, String)> = None;
 
     // --- LAN peer sync setup ---
+    // nothing binds until a join code is set
     let my_hostname = get_hostname();
-    let tcp_listener = TcpListener::bind("0.0.0.0:0").ok();
-    let my_tcp_port = tcp_listener.as_ref().map(|l| l.local_addr().unwrap().port()).unwrap_or(0);
+    let sync_key: SharedKey = Arc::new(Mutex::new(
+        cfg.join_code.as_deref().and_then(join::GroupKey::from_code),
+    ));
     let peer_state = Arc::new(Mutex::new(PeerState {
         peers: HashMap::new(),
         remote_entries: Vec::new(),
         dirty: false,
     }));
-
-    if let Some(listener) = tcp_listener {
-        start_tcp_server(listener, sources.clone());
+    let mut my_tcp_port: u16 = 0;
+    if cfg.join_code.is_some() {
+        my_tcp_port = start_sync(sources.clone(), Arc::clone(&sync_key), Arc::clone(&peer_state), my_hostname.clone());
     }
-    if my_tcp_port > 0 {
-        start_beacon_sender(my_hostname.clone(), my_tcp_port);
-        start_beacon_listener(Arc::clone(&peer_state), my_hostname.clone());
-    }
+    let mut joining = false;
+    let mut join_buf = String::new();
 
     let mut last_merged: Vec<TranscriptEntry> = Vec::new();
 
@@ -2605,7 +2651,7 @@ fn main() {
                     match remote {
                         Some(origin) => {
                             // re-fetch from peer
-                            let msgs = fetch_remote_messages(origin.tcp_addr, chat_uuid);
+                            let msgs = fetch_remote_messages(origin, chat_uuid);
                             if !msgs.is_empty() {
                                 let old_len = lines.len();
                                 *groups = group_messages(&msgs);
@@ -2794,6 +2840,44 @@ fn main() {
         let shift = window.is_key_down(Key::LeftShift) || window.is_key_down(Key::RightShift);
 
         for key in window.get_keys_pressed(KeyRepeat::Yes) {
+            if joining {
+                match key {
+                    Key::Escape => {
+                        joining = false;
+                        join_buf.clear();
+                    }
+                    Key::Enter => {
+                        let input = join_buf.trim().to_string();
+                        let code = if input.is_empty() { None } else { join::normalize(&input) };
+                        if !input.is_empty() && code.is_none() {
+                            flash = Some((Instant::now(), "bad code".into()));
+                            continue;
+                        }
+                        apply_join_code(code, &mut cfg, &sync_key, &peer_state);
+                        if cfg.join_code.is_some() && my_tcp_port == 0 {
+                            my_tcp_port = start_sync(sources.clone(), Arc::clone(&sync_key), Arc::clone(&peer_state), my_hostname.clone());
+                        }
+                        let label = if cfg.join_code.is_some() { "joined" } else { "sync off" };
+                        flash = Some((Instant::now(), label.into()));
+                        joining = false;
+                        join_buf.clear();
+                    }
+                    Key::Backspace => {
+                        join_buf.pop();
+                    }
+                    Key::V if ctrl => {
+                        if let Some(text) = clipboard.as_mut().and_then(|cb| cb.get_text().ok()) {
+                            join_buf.push_str(text.trim());
+                        }
+                    }
+                    other => {
+                        if let Some(ch) = key_to_char(other, shift) {
+                            join_buf.push(ch);
+                        }
+                    }
+                }
+                continue;
+            }
             if ctrl {
                 match key {
                     Key::Equal | Key::NumPadPlus => {
@@ -2845,7 +2929,7 @@ fn main() {
                                         continue;
                                     }
                                     let msgs = match &entry.remote {
-                                        Some(origin) => fetch_remote_messages(origin.tcp_addr, &entry.uuid),
+                                        Some(origin) => fetch_remote_messages(origin, &entry.uuid),
                                         None => load_messages(&entry.path, &entry.source_format),
                                     };
                                     let name = chats.get(&entry.uuid).and_then(|m| m.name.as_ref()).cloned();
@@ -2994,7 +3078,7 @@ fn main() {
                                     cfg.theme = available_themes[theme_selected].2.clone();
                                     save_config(&cfg);
                                     needs_theme_reload = true;
-                                    theme_flash = Some(Instant::now());
+                                    flash = Some((Instant::now(), format!("theme: {}", available_themes[theme_selected].1)));
                                 }
                             }
                             Key::Slash if shift => {
@@ -3003,6 +3087,21 @@ fn main() {
                             }
                             Key::H if !show_help => {
                                 show_help = true;
+                            }
+                            Key::J if shift => {
+                                let code = join::new_code();
+                                if let Some(ref mut cb) = clipboard {
+                                    let _ = cb.set_text(&code);
+                                }
+                                apply_join_code(Some(code), &mut cfg, &sync_key, &peer_state);
+                                if my_tcp_port == 0 {
+                                    my_tcp_port = start_sync(sources.clone(), Arc::clone(&sync_key), Arc::clone(&peer_state), my_hostname.clone());
+                                }
+                                flash = Some((Instant::now(), "code copied".into()));
+                            }
+                            Key::J => {
+                                joining = true;
+                                join_buf.clear();
                             }
                             Key::N if !show_help => {
                                 *renaming = true;
@@ -3098,7 +3197,7 @@ fn main() {
                                 if let Some(entry) = filtered.get(*selected).cloned() {
                                     let fmt = entry.source_format.clone();
                                     let msgs = match &entry.remote {
-                                        Some(origin) => fetch_remote_messages(origin.tcp_addr, &entry.uuid),
+                                        Some(origin) => fetch_remote_messages(origin, &entry.uuid),
                                         None => load_messages(&entry.path, &fmt),
                                     };
                                     let groups = group_messages(&msgs);
@@ -3182,7 +3281,7 @@ fn main() {
                             if let Some(entry) = all.get(next_idx).cloned() {
                                 let fmt = entry.source_format.clone();
                                 let msgs = match &entry.remote {
-                                    Some(origin) => fetch_remote_messages(origin.tcp_addr, &entry.uuid),
+                                    Some(origin) => fetch_remote_messages(origin, &entry.uuid),
                                     None => load_messages(&entry.path, &fmt),
                                 };
                                 let groups = group_messages(&msgs);
@@ -3229,7 +3328,7 @@ fn main() {
                             cfg.theme = available_themes[theme_selected].2.clone();
                             save_config(&cfg);
                             needs_theme_reload = true;
-                            theme_flash = Some(Instant::now());
+                            flash = Some((Instant::now(), format!("theme: {}", available_themes[theme_selected].1)));
                         }
                     }
                     Key::Up if show_help => {}
@@ -3531,7 +3630,18 @@ fn main() {
                     draw_text_ttf(
                         &mut buffer, PAD, header_y, title, c_accent, &mut atlas, buf_w, buf_h,
                     );
-                    if *renaming {
+                    if joining {
+                        let prompt = format!("code: {}_", join_buf);
+                        let prompt_w = prompt.len() as i32 * advance;
+                        let sx = win_w as i32 - PAD - prompt_w - 8;
+                        fill_rect(
+                            &mut buffer, sx - 4, 2, prompt_w + 12, HEADER_H - 4, c_search_bg,
+                            buf_w, buf_h,
+                        );
+                        draw_text_ttf(
+                            &mut buffer, sx, header_y, &prompt, c_text, &mut atlas, buf_w, buf_h,
+                        );
+                    } else if *renaming {
                         let prompt = format!("name: {}_", rename_buf);
                         let prompt_w = prompt.len() as i32 * advance;
                         let sx = win_w as i32 - PAD - prompt_w - 8;
@@ -3623,6 +3733,8 @@ fn main() {
                     "  F            star/unstar",
                     "  Shift+F      toggle favs filter",
                     "  Ctrl+E       export selected",
+                    "  J            join code",
+                    "  Shift+J      new code",
                     "  Ctrl+/\u{2212}      font size",
                     "  Esc          clear / quit",
                     "  ? / H        toggle help",
@@ -3670,11 +3782,9 @@ fn main() {
             total_h += lh; // "T  cycle theme" line
             total_h += gap + sep_h + gap; // separator 2
             // Connected peers section (always show)
-            total_h += lh; // network label (hostname:port)
-            if !peer_names.is_empty() {
-                total_h += peer_names.len() as i32 * lh; // peer names
-            } else {
-                total_h += lh; // "no peers"
+            total_h += lh; // join code or "sync off"
+            if cfg.join_code.is_some() {
+                total_h += peer_names.len().max(1) as i32 * lh; // peer names or "no peers"
             }
             total_h += gap + sep_h + gap; // separator 3
             total_h += lh; // theme label
@@ -3742,10 +3852,17 @@ fn main() {
             fill_rect(&mut buffer, px, cy, panel_w, sep_h, c_sep, buf_w, buf_h);
             cy += sep_h + gap;
             // Connected peers section (always show)
-            let net_label = format!("  {} :{}", my_hostname, my_tcp_port);
-            draw_text_ttf(&mut buffer, px, cy, &net_label, c_dim, &mut atlas, buf_w, buf_h);
+            match &cfg.join_code {
+                Some(code) => {
+                    let net_label = format!("  {}  {}", my_hostname, code);
+                    draw_text_ttf(&mut buffer, px, cy, &net_label, c_dim, &mut atlas, buf_w, buf_h);
+                }
+                None => draw_text_ttf(&mut buffer, px, cy, "  sync off", c_dim, &mut atlas, buf_w, buf_h),
+            }
             cy += lh;
-            if !peer_names.is_empty() {
+            if cfg.join_code.is_none() {
+                // sync off: no peer list
+            } else if !peer_names.is_empty() {
                 for name in &peer_names {
                     let peer_line = format!("    {}", name);
                     draw_text_ttf(&mut buffer, px, cy, &peer_line, c_accent, &mut atlas, buf_w, buf_h);
@@ -3775,19 +3892,16 @@ fn main() {
 
         }
 
-        // Theme name flash at bottom of window (shown for 2 seconds after T press)
-        if let Some(flash_time) = theme_flash {
+        // Status flash at bottom of window (theme name, join code) for 2 seconds
+        if let Some((flash_time, ref label)) = flash {
             if flash_time.elapsed().as_secs_f32() < 2.0 {
-                if let Some((_, ref name, _)) = available_themes.get(theme_selected) {
-                    let label = format!("theme: {}", name);
-                    let label_w = label.len() as i32 * advance;
-                    let tx = (win_w as i32 - label_w) / 2;
-                    let ty = win_h as i32 - lh - PAD;
-                    fill_rect(&mut buffer, tx - PAD, ty - 2, label_w + PAD * 2, lh + 4, c_header_bg, buf_w, buf_h);
-                    draw_text_ttf(&mut buffer, tx, ty, &label, c_accent, &mut atlas, buf_w, buf_h);
-                }
+                let label_w = label.chars().count() as i32 * advance;
+                let tx = (win_w as i32 - label_w) / 2;
+                let ty = win_h as i32 - lh - PAD;
+                fill_rect(&mut buffer, tx - PAD, ty - 2, label_w + PAD * 2, lh + 4, c_header_bg, buf_w, buf_h);
+                draw_text_ttf(&mut buffer, tx, ty, label, c_accent, &mut atlas, buf_w, buf_h);
             } else {
-                theme_flash = None;
+                flash = None;
             }
         }
 

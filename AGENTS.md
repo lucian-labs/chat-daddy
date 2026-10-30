@@ -134,6 +134,7 @@ No arguments needed — config auto-generates on first run at `~/.chat-daddy/con
 ## Architecture
 
 - **Single file app**: `src/main.rs` (~3000 lines) — all logic, rendering, networking
+- **Join codes / sync crypto**: `src/join.rs` — code format, key derivation, sealed beacons and TCP channel
 - **Font rendering**: `src/font.rs` — TTF rasterization via fontdue with glyph caching
 - **Config**: `~/.chat-daddy/config.json` — auto-generated, stores sources, font, theme, LLM endpoint
 - **Chat metadata**: `~/.chat-daddy/chats.json` — per-chat names, stars, auto_named flags
@@ -146,7 +147,7 @@ All in Cargo.toml — no system libraries needed except a monospace TTF font (de
 ## Key Concepts
 
 - **Sources**: Chat transcript directories (Claude `~/.claude/projects`, Cursor `~/.cursor/agent-transcripts`, Codex `~/.codex/sessions`). Auto-detected on first run.
-- **LAN Sync**: UDP broadcast on port 21847 for peer discovery, TCP on random port for chat data exchange. Peers appear inline in the list with `hostname · platform` labels.
+- **LAN Sync**: off until a join code is set (`J` join, `Shift+J` new code; `"join_code"` in config). Machines sharing the code discover each other via sealed UDP beacons on port 21847 and exchange chats over TCP (random port) with a nonce handshake + ChaCha20-Poly1305 frames — see `src/join.rs`. Peers appear inline with `hostname · platform` labels.
 - **LLM Auto-Naming**: Optional local Qwen2.5-0.5B on port 1235 for naming unnamed chats. Not required — app works fine without it.
 
 ## Commit Rules
